@@ -2,9 +2,11 @@ import json
 import rel
 import time
 import socket
+import signal
+import threading
 from typing import Callable, Optional, Union
+from functools import partial
 
-from binance.lib.authentication import hmac_hashing, rsa_signature
 from binance.um_futures import UMFutures
 from binance.um_futures.data_stream import *
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient as client
@@ -82,46 +84,68 @@ class UserDataStream(BinanceWebsocketClient):
         self.listen_key = listen_key
         return listen_key
     
-class DepthTime(object):
+class QuoteTime(object):
     def __init__(self, update_id, exchange_time):
-        self.recv_time = time.time()
+        self.recv_time = time.time() * 1000
         self.update_id = update_id
         self.exchange_time = exchange_time
         
     def __str__(self):
-        return f'{self.update_id}:{self.recv_time}:{self.exchange_time}'
+        return f'{self.update_id}:{self.recv_time}:{self.exchange_time}\t'
 
 depth_map = {}
 
-def on_quote_message(_, message):
-    print("unauth", message)
+last_recv_time = {}
+count = 0
+total = 0
+def on_quote_message(tag, d, message):
+    global last_recv_time, count, total
     msg = json.loads(message)
+    now = time.time() * 1000
+    interval = now - (last_recv_time[tag] if tag in last_recv_time else 0)
+    # print(f"{tag} interval", interval)
+    last_recv_time[tag] = now
+    # print(f"{tag}", now, msg['data'])
     if 'depth' in msg['stream']:
         depth_time = on_depth(msg)
         if depth_time.update_id in depth_map:
-            print("found", depth_time.update_id, depth_map[depth_time.update_id], depth_time)
+            # print("found", depth_time.update_id, depth_map[depth_time.update_id], depth_time)
+            count += 1
+            if tag == 'auth':
+                total += depth_time.recv_time - depth_map[depth_time.update_id].recv_time
+            else:
+                total += depth_map[depth_time.update_id].recv_time - depth_time.recv_time 
         else:
             depth_map[depth_time.update_id] = depth_time
-    
-def on_auth_quote_message(_, message):
-    print("auth", message)
-    msg = json.loads(message)
-    if 'depth' in msg['stream']:
-        depth_time = on_depth(msg)
-        if depth_time.update_id in depth_map:
-            print("found", depth_time.update_id, depth_map[depth_time.update_id], depth_time)
+    elif 'bookTicker' in msg['stream']:
+        bookticker_time = on_bookticker(msg)
+        if bookticker_time.update_id in depth_map:
+            # print("found", bookticker_time.update_id, depth_map[bookticker_time.update_id], bookticker_time)
+            count += 1
+            if tag == 'auth':
+                total += bookticker_time.recv_time - depth_map[bookticker_time.update_id].recv_time
+            else:
+                total += depth_map[bookticker_time.update_id].recv_time - bookticker_time.recv_time 
         else:
-            depth_map[depth_time.update_id] = depth_time
-        
+            depth_map[bookticker_time.update_id] = bookticker_time
+           
+def on_bookticker(msg):
+    data = msg
+    if 'data' in msg:
+        data = msg['data']
+    return QuoteTime(data['u'], data['T'])
     
 def on_depth(msg):
-    return DepthTime(msg['data']['u'], msg['data']['E'])
+    data = msg
+    if 'data' in msg:
+        data = msg['data']
+    return QuoteTime(data['u'], data['E'])
 
 def create_user_stream_websocket():
     ws_client = UserDataStream(stream_url="wss://stream.binance.com:443/ws")
     return ws_client
     
-class WrapperWebSocketClient(WebSocketApp):
+class WrapperWebSocketClient(WebSocketApp, threading.Thread):
     def __init__(self, url: str, name=None, listen_key = None, header: Union[list, dict, Callable] = None,
                  on_open: Callable = None, on_message: Callable = None, on_error: Callable = None,
                  on_close: Callable = None, on_ping: Callable = None, on_pong: Callable = None,
@@ -134,25 +158,19 @@ class WrapperWebSocketClient(WebSocketApp):
                          on_close, on_ping, on_pong, on_cont_message, 
                          keep_running, get_mask_key, cookie, subprotocols, 
                          on_data, socket)
+        threading.Thread.__init__(self)
         self.listen_key = listen_key
         self.name = name
-    
-    def get_base_url(self):
-        if self.listen_key is None:
-            return "wss://fstream.binance.com/stream?streams="
-        return "wss://fstream-auth.binance.com/stream?streams="
-        
-    def combian_url(self, symbol, quote):
-        url = f'{self.get_base_url()}{symbol}@{quote}'
-        if self.listen_key is not None:
-            url = f'{url}&listenKey={self.listen_key}'
-        self.url = url
         
     def subscribe(self, params=None):
         self.send(json.dumps(params))
         
     def on_ping(self, _, message):
         self.send("", ABNF.OPCODE_PONG)
+        
+    def run(self):
+        self.run_forever(reconnect=5, ping_interval=30)
+        rel.dispatch()
 
 symbol = "btcusdt"    
 
@@ -162,16 +180,27 @@ def create_firse_quote_ws():
     rel.signal(2, rel.abort)
     rel.dispatch()
     
-def create_quote_wss(listen_key):
-    ws_client1 = WrapperWebSocketClient(url="wss://fstream-auth.binance.com", listen_key=listen_key, on_message=on_auth_quote_message)
-    ws_client1.combian_url(symbol=symbol, quote="depth")
-    ws_client1.run_forever(dispatcher=rel, reconnect=5, ping_interval=30)
+def combina_url(listen_key, symbol, quote):
+    url = "wss://fstream-auth.binance.com/stream?streams="
+    if listen_key is None:
+        url = "wss://fstream.binance.com/stream?streams="
+        
+    url = f'{url}{symbol}@{quote}'
+    if listen_key is not None:
+        url = f'{url}&listenKey={listen_key}'
+    return url
     
-    ws_client = WrapperWebSocketClient(url="wss://fstream.binance.com", on_message=on_quote_message)
-    ws_client.combian_url(symbol=symbol, quote="depth")
-    ws_client.run_forever(dispatcher=rel, reconnect=5, ping_interval=30)
-    rel.signal(2, rel.abort)
-    rel.dispatch()
+def create_quote_wss(listen_key):
+    quote_fn = partial(on_quote_message, "auth")
+    url = combina_url(listen_key, symbol=symbol, quote="bookTicker")
+    ws_client1 = WrapperWebSocketClient(url=url, listen_key=listen_key, on_message=quote_fn)
+    ws_client1.start()
+    time.sleep(10)
+    quote_fn = partial(on_quote_message, "unauth")
+    url = combina_url(listen_key=None, symbol=symbol, quote="bookTicker")
+    ws_client = WrapperWebSocketClient(url=url,on_message=quote_fn)
+    ws_client.start()
+    return (ws_client1, ws_client)
     
 def main():
     # user_date_stream = create_user_stream_websocket()
@@ -183,9 +212,14 @@ def main():
         
     listen_key = resp['listenKey']
     auth_ws = create_quote_wss(listen_key)
+    sig_fn = partial(tear_down, auth_ws[0], auth_ws[1])
+    signal.signal(signal.SIGINT, sig_fn)
     
-    time.sleep(300)
-    auth_ws.stop()
+
+def tear_down(ws1, ws2, signalnum, frame):
+    print(f"total delay {total}, count {count}, avg {total/count}ms")
+    ws1.stop()
+    ws2.stop()
     
 if __name__ == '__main__':
     main()
